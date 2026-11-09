@@ -66,6 +66,12 @@ Platform: **Linux x86_64** (first slice).
 - Every release carries a **GitHub release attestation**; provenance is verified offline from the attestation bundle, with the signer pinned to `Archright/Axiom`.
 - Customer-side verification = `SHA256SUMS` (sha256) + offline attestation-bundle verification. It requires no access to Archright repositories — only your own GitHub token for `gh`.
 
+## Verification adapter
+
+[`.github/workflows/ax-verify.yml`](./.github/workflows/ax-verify.yml) is a **reusable workflow** (`workflow_call` + `workflow_dispatch`) that verifies an external project with a published release bundle end-to-end on a clean `ubuntu-24.04` runner: it re-verifies the whole integrity chain (`sha256sum -c`, offline attestation, manifest binding, `ax --version`), checks out the pinned subject, provisions the pinned toolchain, runs `ax prove --proposals … --project …` and asserts Zero-Footprint (pre==post subject tree hash) plus a 64-hex `engineBuild` guard against vacuous runs. Call it from a Job in your repository (`uses: Archright/axiom-cli/.github/workflows/ax-verify.yml@<merged-main-sha>`) with `axiom-version`, `subject-repository`, `subject-commit` and a propositions artifact — a machine-readable `verify-record.json` and the full evidence (logs, state, fingerprints, toolchain observations) are returned as the `ax-verify-evidence-<source>-<label>` artifact, plus workflow outputs (`prove-exit`, `canonical-digest`, `engine-build-id`, `verdict-summary`, `zero-footprint-ok`, `runner-image`). Exit semantics: `ax prove` exit 0 (PROVED) and 1 (DISPROVED) are both in-contract completions and keep the workflow green; ≥2 fails closed.
+
+For a `workflow_dispatch` smoke, pass the propositions document inline via `proposals-inline` (a reference example of a propositions JSON — subject pin + specId + target — is preserved in the history of the public `Archright/nim-libp2p` repository, `git show cfed3871:.github/workflows/byo-agent-verify.yml`); the first end-to-end exercise of this adapter is that post-release dispatch smoke, not a pre-publication claim.
+
 ## License
 
 Distributed under the **Axiom Source-Available License 1.0 (SAL 1.0)** — [`LICENSE`](LICENSE) (redistribution must carry `LICENSE`, `LICENSES/`, and `THIRD-PARTY-NOTICES.md`; see SAL 1.0 §6.1).
