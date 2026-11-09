@@ -1,0 +1,739 @@
+# ax-verify — S4 public execution adapter (reusable bundle-verification workflow).
+#
+# Single-purpose adapter: verify an EXTERNAL project ("customer repository")
+# with an Axiom release bundle published to THIS repository (Archright/axiom-cli,
+# productization contract §1b Binary Distribution Contract). The engine never
+# runs from source here — the `ax` binary is the release-bundle payload, whose
+# integrity chain is re-verified on every run:
+#
+#   gh release download vX --repo Archright/axiom-cli
+#   sha256sum -c SHA256SUMS
+#   gh attestation verify <bundle> --bundle <attestation-bundle> --signer-repo Archright/Axiom
+#   manifest binding (bundleSha256 / binarySha256 / version / tag / platform)
+#   ./ax --version (real execution at the bundle root)
+#
+# Exit semantics (BYO-Agent proposition contract §8, engine 5-state vocabulary):
+#   ax prove exit 0 (PROVED) and 1 (DISPROVED) are BOTH in-contract verification
+#   completions — they do not fail this workflow and do not skip reporting.
+#   exit 2 (internal error) / 3 (INPUT_REJECTED) / other = failure, fail-closed.
+#   An in-contract exit with no persisted proof state is a broken run (exit 2),
+#   never a verdict.
+#
+# Zero-Footprint: the subject checkout lives in ./subject (read-only for the
+# whole run); propositions, Axiom state and evidence live under runner.temp.
+# pre/post `git rev-parse HEAD^{tree}` + `git status --porcelain` pin the
+# subject identity; any drift fails the run.
+#
+# engineBuild guard (vacuous-run prevention): the run's vault certificates must
+# carry a 64-hex `toolchainIdentity.engineBuild` — "unmeasured" or missing
+# identities make the certificate inadmissible (Axiom FREEZE engineBuild rule).
+#
+# Honest status: NOT yet exercised end-to-end. The first release has not been
+# published; the first live proof of this workflow is a workflow_dispatch smoke
+# run after Release v0.6.0 is published (see README 'Verification adapter').
+
+name: 'ax-verify — bundle verification adapter (S4)'
+
+on:
+  workflow_call:
+    inputs:
+      axiom-version:
+        description: 'Axiom release version to verify with (e.g. "0.6.0" — normalized to the vX.Y.Z release tag).'
+        required: true
+        type: string
+      subject-repository:
+        description: 'Subject repository slug (owner/repo) under verification; declared to the engine via AXIOM_SUBJECT_REPOSITORY.'
+        required: true
+        type: string
+      subject-commit:
+        description: 'Full 40-hex subject commit under verification; declared to the engine via AXIOM_SUBJECT_COMMIT.'
+        required: true
+        type: string
+      proposals-artifact:
+        description: 'Name of the caller-run artifact carrying the propositions JSON document. Empty → proposals-inline is used.'
+        required: false
+        type: string
+        default: ''
+      proposals-inline:
+        description: 'Inline propositions JSON document (dispatch smoke). Empty → proposals-artifact is used. Both empty → fail.'
+        required: false
+        type: string
+        default: ''
+      proposals-path:
+        description: 'Relative path of the propositions JSON document inside the proposals artifact.'
+        required: false
+        type: string
+        default: 'proposals.json'
+      replay-dep-pins:
+        description: 'Pinned replay dependency checkouts exported as AXIOM_REPLAY_DEP_PATHS. One "owner/repo <full 40-hex sha>" per line.'
+        required: false
+        type: string
+        default: |
+          status-im/nim-serialization b5473564e80a4908cf6c5a038e4c4a6ca7de2223
+          status-im/nim-faststreams 059bc2f52546ac14b583639c33372c14b1d46fa3
+          status-im/nim-stew 4382b18f04b3c43c8409bfcd6b62063773b2bbaa
+          arnetheduck/nim-results df8113dda4c2d74d460a8fa98252b0b771bf1f27
+      run-label:
+        description: 'Run identifier used in the evidence artifact name (disambiguates caller matrix legs).'
+        required: false
+        type: string
+        default: 'run'
+    outputs:
+      prove-exit:
+        description: 'ax prove exit code (0=PROVED, 1=DISPROVED — both in-contract; ≥2 = fail-closed failure).'
+        value: ${{ jobs.ax-verify.outputs.prove-exit }}
+      canonical-digest:
+        description: 'Canonical projection digest from `ax report --canonical-digest` (64-hex; empty when the run failed before reporting).'
+        value: ${{ jobs.ax-verify.outputs.canonical-digest }}
+      engine-build-id:
+        description: 'Verifier build identity (64-hex) observed in the run vault certificates; empty when the guard did not run.'
+        value: ${{ jobs.ax-verify.outputs.engine-build-id }}
+      verdict-summary:
+        description: 'runOutcome verdict/gateVerdict plus the first unit propositionVerdict ("n/a" when absent).'
+        value: ${{ jobs.ax-verify.outputs.verdict-summary }}
+      zero-footprint-ok:
+        description: '"true" when pre==post subject tree hash and porcelain is clean at both ends; "false"/empty otherwise.'
+        value: ${{ jobs.ax-verify.outputs.zero-footprint-ok }}
+      runner-image:
+        description: 'Observed runner image (ImageOS/ImageVersion; "unknown:" prefix when the observation failed).'
+        value: ${{ jobs.ax-verify.outputs.runner-image }}
+  workflow_dispatch:
+    inputs:
+      axiom-version:
+        description: 'Axiom release version to verify with (e.g. "0.6.0").'
+        required: true
+        type: string
+      subject-repository:
+        description: 'Subject repository slug (owner/repo) under verification.'
+        required: true
+        type: string
+      subject-commit:
+        description: 'Full 40-hex subject commit under verification.'
+        required: true
+        type: string
+      proposals-artifact:
+        description: 'Caller-run artifact name carrying the propositions JSON. Empty → proposals-inline is used.'
+        required: false
+        type: string
+        default: ''
+      proposals-inline:
+        description: 'Inline propositions JSON document (dispatch smoke input). Both sources empty → fail.'
+        required: false
+        type: string
+        default: ''
+      proposals-path:
+        description: 'Relative path of the propositions JSON document inside the artifact.'
+        required: false
+        type: string
+        default: 'proposals.json'
+      replay-dep-pins:
+        description: 'Pinned replay deps ("owner/repo <40-hex>" per line), exported as AXIOM_REPLAY_DEP_PATHS.'
+        required: false
+        type: string
+        default: |
+          status-im/nim-serialization b5473564e80a4908cf6c5a038e4c4a6ca7de2223
+          status-im/nim-faststreams 059bc2f52546ac14b583639c33372c14b1d46fa3
+          status-im/nim-stew 4382b18f04b3c43c8409bfcd6b62063773b2bbaa
+          arnetheduck/nim-results df8113dda4c2d74d460a8fa98252b0b771bf1f27
+      run-label:
+        description: 'Run identifier for the evidence artifact name.'
+        required: false
+        type: string
+        default: 'run'
+
+jobs:
+  ax-verify:
+    name: 'verify subject with the pinned release bundle (no source, no secrets)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      prove-exit: ${{ steps.prove.outputs.prove-exit }}
+      canonical-digest: ${{ steps.digest.outputs.canonical-digest }}
+      engine-build-id: ${{ steps.engine-build-guard.outputs.engine-build-id }}
+      verdict-summary: ${{ steps.digest.outputs.verdict-summary }}
+      zero-footprint-ok: ${{ steps.fingerprint-post.outputs.zero-footprint-ok }}
+      runner-image: ${{ steps.runner-image.outputs.runner-image }}
+    steps:
+      - name: 'Validate contract inputs (fail-closed pins)'
+        env:
+          AXIOM_VERSION_RAW: ${{ inputs.axiom-version }}
+          SUBJECT_REPOSITORY: ${{ inputs.subject-repository }}
+          SUBJECT_COMMIT: ${{ inputs.subject-commit }}
+          PROPOSALS_ARTIFACT: ${{ inputs.proposals-artifact }}
+          PROPOSALS_INLINE: ${{ inputs.proposals-inline }}
+          RUN_LABEL: ${{ inputs.run-label }}
+          DEP_PINS: ${{ inputs.replay-dep-pins }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::validate: $1" >&2; exit 1; }
+          check_sha() {
+            printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{40}$' \
+              || fail "$2 must be a full 40-hex commit SHA (got '$1')"
+          }
+          check_slug() {
+            printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+              || fail "$2 must be an owner/repo slug (got '$1')"
+          }
+          check_name() {
+            printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]*$' \
+              || fail "$2 must be artifact-name safe [A-Za-z0-9._-] (got '$1')"
+          }
+          check_sha "$SUBJECT_COMMIT" 'subject-commit'
+          check_slug "$SUBJECT_REPOSITORY" 'subject-repository'
+          check_name "$RUN_LABEL" 'run-label'
+          check_name "$PROPOSALS_ARTIFACT" 'proposals-artifact'
+          # axiom-version: strip whitespace, v-prefix normalization, semver shape
+          # (release-ship ④ parity — ^v\d+\.\d+\.\d+$)
+          VERSION_NORM="$(printf '%s' "$AXIOM_VERSION_RAW" | tr -d '[:space:]')"
+          case "$VERSION_NORM" in v*) ;; *) VERSION_NORM="v$VERSION_NORM" ;; esac
+          printf '%s' "$VERSION_NORM" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            || fail "axiom-version '$AXIOM_VERSION_RAW' does not normalize to ^v[0-9]+.[0-9]+.[0-9]+ (got '$VERSION_NORM')"
+          [ "${#VERSION_NORM}" -le 100 ] || fail "axiom-version length ${#VERSION_NORM} > 100"
+          # replay-dep-pins: owner/repo + full 40-hex per line
+          while IFS=' ' read -r slug sha; do
+            [ -n "$slug" ] || continue
+            check_slug "$slug" 'replay-dep-pins entry'
+            check_sha "$sha" "replay-dep-pins sha for $slug"
+          done < <(printf '%s\n' "$DEP_PINS")
+          # propositions source: artifact XOR inline — both empty is a contract hole
+          if [ -z "$PROPOSALS_ARTIFACT" ] && [ -z "$PROPOSALS_INLINE" ]; then
+            fail 'no propositions source: proposals-artifact and proposals-inline are both empty'
+          fi
+          {
+            echo "AXIOM_VERSION_NORM=$VERSION_NORM"
+            echo "AXIOM_VERSION_PLAIN=${VERSION_NORM#v}"
+          } >> "$GITHUB_ENV"
+          echo "validate: OK — version=$VERSION_NORM subject=$SUBJECT_REPOSITORY@$SUBJECT_COMMIT label='$RUN_LABEL'"
+
+      - name: 'Acquire + verify release bundle (checksums, attestation, manifest binding)'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh repo context for `gh attestation verify` (workspace holds no git repo here);
+          # the attestation was produced by release-ship in the Axiom source repository.
+          GH_REPO: Archright/Axiom
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::bundle: $1" >&2; exit 1; }
+          rel="${RUNNER_TEMP}/ax-release"
+          evidence="${RUNNER_TEMP}/ax-evidence"
+          mkdir -p "$rel" "$evidence"
+          # libpcre3 FIRST: ax loads libpcre.so.3 at startup (README runtime
+          # requirements) and the bare runner image omits it — `./ax --version`
+          # below cannot run without it.
+          if ! ldconfig -p 2>/dev/null | grep -q 'libpcre\.so'; then
+            sudo apt-get -o DPkg::Lock::Timeout=300 update -qq \
+              && sudo apt-get -o DPkg::Lock::Timeout=300 install -y -qq libpcre3
+          fi
+          ldconfig -p | grep 'libpcre\.so\.3' >/dev/null \
+            || fail 'libpcre.so.3 absent after install'
+          # jq for manifest parsing (GitHub-hosted images carry it — fail-closed re-check)
+          command -v jq >/dev/null 2>&1 || {
+            sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
+            sudo apt-get -o DPkg::Lock::Timeout=300 install -y -qq jq
+          }
+          command -v jq >/dev/null 2>&1 || fail 'jq unavailable'
+          gh release download "$AXIOM_VERSION_NORM" -R Archright/axiom-cli --dir "$rel" --clobber \
+            || fail "gh release download $AXIOM_VERSION_NORM from Archright/axiom-cli failed (is the release published?)"
+          cd "$rel"
+          for f in SHA256SUMS manifest.json attestation-bundle.jsonl; do
+            [ -f "$f" ] || fail "release asset '$f' missing"
+          done
+          BUNDLE_TAR="$(ls axiom-bundle-*.tar.gz 2>/dev/null | head -1)"
+          [ -n "$BUNDLE_TAR" ] || fail 'no axiom-bundle-*.tar.gz asset in the release'
+          sha256sum -c SHA256SUMS || fail 'SHA256SUMS verification failed'
+          # provenance: offline bundle verification, signer pinned to the Axiom
+          # source repo (§1b trust model — README consumption contract)
+          gh attestation verify "$BUNDLE_TAR" --bundle attestation-bundle.jsonl --signer-repo Archright/Axiom \
+            || fail 'gh attestation verify failed (signer-repo Archright/Axiom)'
+          mkdir -p "${RUNNER_TEMP}/ax-bundle"
+          tar -xzf "$BUNDLE_TAR" -C "${RUNNER_TEMP}/ax-bundle" || fail 'tar extraction failed'
+          anchor_count="$(find "${RUNNER_TEMP}/ax-bundle" -name '.axiom_root' | wc -l)"
+          [ "$anchor_count" -eq 1 ] \
+            || fail "expected exactly one .axiom_root anchor in the bundle, found $anchor_count"
+          BUNDLE_ROOT="$(dirname "$(find "${RUNNER_TEMP}/ax-bundle" -name '.axiom_root' -type f | head -1)")"
+          [ -f "$BUNDLE_ROOT/ax" ] || fail "ax binary missing at the bundle root ($BUNDLE_ROOT)"
+          # manifest binding: every axis must match the observed bytes and the input
+          BUNDLE_SHA="$(sha256sum "$BUNDLE_TAR" | cut -d' ' -f1)"
+          BIN_SHA="$(sha256sum "$BUNDLE_ROOT/ax" | cut -d' ' -f1)"
+          m="$rel/manifest.json"
+          jq -e --arg sv 'axiom.release-bundle.manifest.v1' '.schemaVersion == $sv' "$m" >/dev/null \
+            || fail 'manifest schemaVersion is not axiom.release-bundle.manifest.v1'
+          jq -e --arg p 'linux-x86_64' '.platform == $p' "$m" >/dev/null \
+            || fail 'manifest platform is not linux-x86_64'
+          jq -e --arg t "$AXIOM_VERSION_NORM" '.tag == $t' "$m" >/dev/null \
+            || fail "manifest tag != $AXIOM_VERSION_NORM"
+          jq -e --arg v "$AXIOM_VERSION_PLAIN" '.version == $v' "$m" >/dev/null \
+            || fail "manifest version != $AXIOM_VERSION_PLAIN"
+          jq -e --arg bt "$BUNDLE_TAR" '.bundlePath == $bt' "$m" >/dev/null \
+            || fail 'manifest bundlePath does not match the downloaded asset name'
+          jq -e --arg bs "$BUNDLE_SHA" '.bundleSha256 == $bs' "$m" >/dev/null \
+            || fail "manifest bundleSha256 != observed sha256 ($BUNDLE_SHA)"
+          jq -e --arg ns "$BIN_SHA" '.binarySha256 == $ns' "$m" >/dev/null \
+            || fail "manifest binarySha256 != observed ax sha256 ($BIN_SHA)"
+          # real execution: the bundle binary must run at the bundle root
+          version_out="$(cd "$BUNDLE_ROOT" && AXIOM_ROOT="$BUNDLE_ROOT" ./ax --version)" \
+            || fail 'ax --version execution failed at the bundle root'
+          version_out="$(printf '%s\n' "$version_out" | head -1 | tr -d '[:space:]')"
+          [ "$version_out" = "$AXIOM_VERSION_NORM" ] \
+            || fail "ax --version '$version_out' != $AXIOM_VERSION_NORM"
+          cp "$m" "$evidence/manifest.json"
+          cp SHA256SUMS "$evidence/SHA256SUMS"
+          printf 'ax --version: %s\n' "$version_out" > "$evidence/ax-version.txt"
+          {
+            echo "AXIOM_BUNDLE_ROOT=$BUNDLE_ROOT"
+            echo "AXIOM_BUNDLE_SHA256=$BUNDLE_SHA"
+            echo "AXIOM_TARBALL_NAME=$BUNDLE_TAR"
+          } >> "$GITHUB_ENV"
+          echo "bundle: OK — root=$BUNDLE_ROOT"
+          echo "bundle: bundleSha256=$BUNDLE_SHA binarySha256=$BIN_SHA ax --version=$version_out"
+
+      - name: 'Checkout subject repository into ./subject (Zero-Footprint)'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.subject-repository }}
+          ref: ${{ inputs.subject-commit }}
+          path: subject
+          persist-credentials: false
+
+      - name: 'Re-assert the subject HEAD pin'
+        env:
+          SUBJECT_REPOSITORY: ${{ inputs.subject-repository }}
+          SUBJECT_COMMIT: ${{ inputs.subject-commit }}
+        run: |
+          set -euo pipefail
+          head="$(git -C subject rev-parse HEAD)"
+          [ "$head" = "$SUBJECT_COMMIT" ] \
+            || { echo "::error::subject HEAD '$head' != pinned '$SUBJECT_COMMIT'"; exit 1; }
+          echo "subject: $SUBJECT_REPOSITORY@$head"
+
+      - name: 'Pre fingerprint (subject tree baseline, porcelain clean)'
+        id: fingerprint-pre
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::pre-fingerprint: $1" >&2; exit 1; }
+          evidence="${RUNNER_TEMP}/ax-evidence"
+          pre_tree="$(git -C subject rev-parse 'HEAD^{tree}')"
+          [ -n "$pre_tree" ] || fail 'HEAD^{tree} resolved empty'
+          porcelain="$(git -C subject status --porcelain)"
+          [ -z "$porcelain" ] \
+            || fail "subject tree is dirty at pre-fingerprint: $porcelain"
+          printf '%s\n' "$pre_tree" > "$evidence/pre_tree_hash.txt"
+          echo "PRE_TREE_HASH=$pre_tree" >> "$GITHUB_ENV"
+          echo "pre-tree=$pre_tree" >> "$GITHUB_OUTPUT"
+          echo "pre fingerprint: tree=$pre_tree porcelain=clean"
+
+      - name: 'Observe runner image (labels + context; failures stated, never masked)'
+        id: runner-image
+        run: |
+          set -euo pipefail
+          imgos="${ImageOS:-}"
+          imgver="${ImageVersion:-}"
+          if [ -n "$imgos" ] && [ -n "$imgver" ]; then
+            runner_image="${imgos}/${imgver}"
+            runner_image_source='env:ImageOS/ImageVersion'
+          else
+            runner_image="unknown:ImageOS=${imgos:-unset}/ImageVersion=${imgver:-unset}"
+            runner_image_source='env:ImageOS/ImageVersion (missing)'
+          fi
+          echo "runner-image=$runner_image" >> "$GITHUB_OUTPUT"
+          {
+            echo "RUNNER_IMAGE=$runner_image"
+            echo "RUNNER_IMAGE_SOURCE=$runner_image_source"
+          } >> "$GITHUB_ENV"
+          {
+            echo "runner_image=$runner_image"
+            echo "runner_image_source=$runner_image_source"
+            echo "runner_os=${RUNNER_OS:-unset}"
+            echo "runner_arch=${RUNNER_ARCH:-unset}"
+            echo "imageos=${imgos:-unset}"
+            echo "imageversion=${imgver:-unset}"
+          } > "${RUNNER_TEMP}/ax-evidence/runner-image.txt"
+          echo "runner image: $runner_image ($runner_image_source) os=${RUNNER_OS:-unset} arch=${RUNNER_ARCH:-unset}"
+
+      - name: 'Provision pinned toolchain directly (libpcre3, Nim tarball, Z3, elan/Lean)'
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::toolchain: $1" >&2; exit 1; }
+          evidence="${RUNNER_TEMP}/ax-evidence"
+          # libpcre3 — installed in the bundle step; idempotent re-check + version record
+          if ! ldconfig -p 2>/dev/null | grep -q 'libpcre\.so'; then
+            sudo apt-get -o DPkg::Lock::Timeout=300 update -qq \
+              && sudo apt-get -o DPkg::Lock::Timeout=300 install -y -qq libpcre3
+          fi
+          ldconfig -p | grep 'libpcre\.so\.3' >/dev/null || fail 'libpcre.so.3 absent'
+          LIBPCRE3_VERSION="$(dpkg-query -W -f='${Version}' libpcre3 2>/dev/null || true)"
+          [ -n "$LIBPCRE3_VERSION" ] || fail 'dpkg-query could not observe the libpcre3 version'
+          # Nim 2.2.10 — S4 decision: direct official tarball, NO choosenim.
+          # sha256 pinned from the official checksum file:
+          #   https://nim-lang.org/download/nim-2.2.10-linux_x64.tar.xz.sha256
+          #   0a3a38752e97e9d44aa479b3a7b37336dfe0176daf22ee5b5218ad0991ecd211
+          NIM_SHA256=0a3a38752e97e9d44aa479b3a7b37336dfe0176daf22ee5b5218ad0991ecd211
+          nimdir="${RUNNER_TEMP}/nim-2.2.10"
+          curl -sSfL --retry 4 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 3 --max-time 600 \
+            'https://nim-lang.org/download/nim-2.2.10-linux_x64.tar.xz' \
+            -o "${RUNNER_TEMP}/nim-2.2.10-linux_x64.tar.xz" \
+            || fail 'Nim 2.2.10 linux_x64 tarball download failed'
+          printf '%s  %s\n' "$NIM_SHA256" "${RUNNER_TEMP}/nim-2.2.10-linux_x64.tar.xz" | sha256sum -c - \
+            || fail "Nim tarball sha256 mismatch (pinned $NIM_SHA256)"
+          mkdir -p "$nimdir"
+          tar -xJf "${RUNNER_TEMP}/nim-2.2.10-linux_x64.tar.xz" -C "$nimdir" --strip-components=1 \
+            || fail 'Nim tarball extraction failed'
+          # fail-closed: replay-harness compilation needs the full compiler tree
+          [ -f "$nimdir/compiler/ast.nim" ] || fail 'Nim compiler sources missing after extraction'
+          "$nimdir/bin/nim" -v | head -1
+          echo "$nimdir/bin" >> "$GITHUB_PATH"
+          # Z3 4.13.3 — pinned release binary (setup-axiom-toolchain recipe, x64 asset;
+          # ax executes z3 as a subprocess — resolveZ3Path priority: env, ~/.local/bin, PATH)
+          [ "$(uname -m)" = 'x86_64' ] \
+            || fail "expected x86_64 on the pinned ubuntu-24.04 image, got $(uname -m)"
+          curl -sSfL 'https://github.com/Z3Prover/z3/releases/download/z3-4.13.3/z3-4.13.3-x64-glibc-2.35.zip' -o /tmp/z3.zip \
+            || fail 'Z3 4.13.3 download failed'
+          unzip -q -o /tmp/z3.zip -d /tmp/z3 || fail 'Z3 unzip failed'
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 /tmp/z3/z3-*/bin/z3 "$HOME/.local/bin/z3" || fail 'Z3 install failed'
+          rm -rf /tmp/z3 /tmp/z3.zip
+          "$HOME/.local/bin/z3" --version | grep -q '4\.13\.3' \
+            || fail 'z3 version is not 4.13.3'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # elan + Lean 4.33.0 (Axiom repo lean-toolchain pin: leanprover/lean4:v4.33.0)
+          curl -sSfL 'https://elan.lean-lang.org/elan-init.sh' -o "${RUNNER_TEMP}/elan-init.sh" \
+            || fail 'elan-init.sh download failed'
+          chmod +x "${RUNNER_TEMP}/elan-init.sh"
+          "${RUNNER_TEMP}/elan-init.sh" -y --default-toolchain leanprover/lean4:v4.33.0 \
+            || fail 'elan install failed'
+          # functional probe: a corrupt-but-present Lake.olean passes [ -f ] —
+          # lean must actually import Lake (incident 35678120915)
+          probe="$(mktemp -d)"
+          printf 'leanprover/lean4:v4.33.0\n' > "$probe/lean-toolchain"
+          printf 'import Lake\n' > "$probe/Probe.lean"
+          ( cd "$probe" && "$HOME/.elan/bin/lean" Probe.lean >/dev/null 2>&1 ) \
+            || fail 'Lake module unusable after elan install'
+          rm -rf "$probe"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          # version observations (recorded, never trusted)
+          {
+            echo "nim=$("$nimdir/bin/nim" -v | head -1)"
+            echo "z3=$("$HOME/.local/bin/z3" --version)"
+            echo "lean=$("$HOME/.elan/bin/lean" --version 2>&1 | head -1)"
+            echo "libpcre3=$LIBPCRE3_VERSION"
+            echo "jq=$(jq --version)"
+          } > "$evidence/toolchain-versions.txt"
+          cat "$evidence/toolchain-versions.txt"
+
+      - name: 'Stage pinned replay dependencies (AXIOM_REPLAY_DEP_PATHS — engine design (b))'
+        env:
+          DEP_PINS: ${{ inputs.replay-dep-pins }}
+        run: |
+          set -euo pipefail
+          deps="${RUNNER_TEMP}/ax-deps"
+          mkdir -p "$deps"
+          paths=""
+          while IFS=' ' read -r slug sha; do
+            [ -n "$slug" ] || continue
+            printf '%s' "$slug" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || {
+              echo "::error::replay-dep-pins entry is not owner/repo: '$slug'"; exit 1; }
+            printf '%s' "$sha" | grep -Eq '^[0-9a-fA-F]{40}$' || {
+              echo "::error::replay-dep-pins sha for $slug is not a full 40-hex commit (pin contract): '$sha'"; exit 1; }
+            name="${slug##*/}"
+            dest="$deps/$name"
+            if [ ! -d "$dest" ]; then
+              git clone --quiet "https://github.com/$slug" "$dest"
+            fi
+            git -C "$dest" checkout --quiet "$sha"
+            echo "staged replay dep: $slug @ $sha"
+            paths="${paths:+$paths:}$dest"
+          done < <(printf '%s\n' "$DEP_PINS")
+          if [ -n "$paths" ]; then
+            echo "AXIOM_REPLAY_DEP_PATHS=$paths" >> "$GITHUB_ENV"
+          else
+            echo 'no replay-dep-pins — engine falls back to nimble store discovery (design (a))'
+          fi
+
+      - name: 'Download propositions artifact (caller boundary — data only)'
+        if: ${{ inputs.proposals-artifact != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.proposals-artifact }}
+          path: '${{ runner.temp }}/ax-incoming'
+
+      - name: 'Seed AXIOM_STATE_DIR from the bundle + stage propositions'
+        env:
+          PROPOSALS_ARTIFACT: ${{ inputs.proposals-artifact }}
+          PROPOSALS_INLINE: ${{ inputs.proposals-inline }}
+          PROPOSALS_PATH: ${{ inputs.proposals-path }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::seed: $1" >&2; exit 1; }
+          state="${RUNNER_TEMP}/axiom-state"
+          evidence="${RUNNER_TEMP}/ax-evidence"
+          mkdir -p "$state/data" "$state/logs"
+          # S4: no Axiom source tree exists — the state seeds come from the bundle
+          cp "$AXIOM_BUNDLE_ROOT/data/verification_scope.lock" "$state/data/" \
+            || fail 'verification_scope.lock missing in the bundle'
+          cp "$AXIOM_BUNDLE_ROOT/data/baseline.json" "$state/data/" \
+            || fail 'baseline.json missing in the bundle'
+          # propositions acquisition: caller artifact (data-only boundary) or
+          # inline document (dispatch smoke). Both-empty was rejected at validation.
+          if [ -n "$PROPOSALS_ARTIFACT" ]; then
+            incoming="${RUNNER_TEMP}/ax-incoming"
+            props="$(basename "$PROPOSALS_PATH")"
+            [ -f "$incoming/$props" ] \
+              || fail "proposals file not found in artifact '$PROPOSALS_ARTIFACT': $PROPOSALS_PATH"
+            cp "$incoming/$props" "$evidence/proposals.json"
+          else
+            printf '%s' "$PROPOSALS_INLINE" > "$evidence/proposals.json"
+          fi
+          jq empty "$evidence/proposals.json" 2>/dev/null \
+            || fail 'proposals document is not valid JSON'
+          sha256sum "$evidence/proposals.json" > "$evidence/proposals.sha256"
+          PROPOSALS_SHA256="$(cut -d' ' -f1 < "$evidence/proposals.sha256")"
+          {
+            echo "AXIOM_STATE_DIR=$state"
+            echo "AXIOM_EVIDENCE_DIR=$evidence"
+            echo "AXIOM_PROOF_STATE=$state/logs/ax_proof_state.json"
+            echo "AXIOM_PROPOSALS_FILE=$evidence/proposals.json"
+            echo "PROPOSALS_SHA256=$PROPOSALS_SHA256"
+          } >> "$GITHUB_ENV"
+          echo "proposals: sha256=$PROPOSALS_SHA256 bytes=$(wc -c < "$evidence/proposals.json")"
+
+      - name: 'Prove propositions (§8 exit transition: 0/1 in-contract, ≥2 fail-closed)'
+        id: prove
+        timeout-minutes: 90
+        env:
+          AXIOM_ROOT: ${{ env.AXIOM_BUNDLE_ROOT }}
+          AXIOM_STATE_DIR: ${{ env.AXIOM_STATE_DIR }}
+          AXIOM_PROVE_WORKERS: '1'
+          AXIOM_SUBJECT_REPOSITORY: ${{ inputs.subject-repository }}
+          AXIOM_SUBJECT_COMMIT: ${{ inputs.subject-commit }}
+          PROVE_BIN: ${{ env.AXIOM_BUNDLE_ROOT }}/ax
+          PROPOSALS_FILE: ${{ env.AXIOM_PROPOSALS_FILE }}
+        run: |
+          set -euo pipefail
+          evidence="$AXIOM_EVIDENCE_DIR"
+          state_file="$AXIOM_PROOF_STATE"
+          set +e
+          "$PROVE_BIN" prove \
+            --proposals "$PROPOSALS_FILE" \
+            --project "$GITHUB_WORKSPACE/subject" \
+            >"$evidence/prove.log" 2>&1
+          ec=$?
+          set -e
+          echo "prove-exit=$ec" >> "$GITHUB_OUTPUT"
+          echo "PROVE_EXIT=$ec" >> "$GITHUB_ENV"
+          tail -n 200 "$evidence/prove.log" || true
+          # honest accounting: an in-contract exit without a persisted proof
+          # state is a broken run, not a verdict.
+          if [ "$ec" -le 1 ] && [ ! -f "$state_file" ]; then
+            echo "::error::ax prove exited $ec but no proof state was persisted at $state_file — cannot account this run"
+            exit 2
+          fi
+          if [ "$ec" -gt 1 ]; then
+            case "$ec" in
+              2) reason='engine internal error (out-of-contract execution failure)' ;;
+              3) reason='INPUT_REJECTED (BAD_SCHEMA / NO_PROPOSALS / SUBJECT_MISMATCH / MULTIPLE_TARGETS)' ;;
+              *) reason='out-of-contract failure (exit vocabulary 0/1/2/3/4)' ;;
+            esac
+            echo "::error::ax prove exit=$ec — $reason (fail-closed)"
+            exit "$ec"
+          fi
+          echo "ax prove exit=$ec — in-contract verification completion (0=PROVED, 1=DISPROVED); workflow continues"
+
+      - name: 'Report + canonical digest (ax report --canonical-digest)'
+        id: digest
+        env:
+          PROVE_BIN: ${{ env.AXIOM_BUNDLE_ROOT }}/ax
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::digest: $1" >&2; exit 1; }
+          evidence="$AXIOM_EVIDENCE_DIR"
+          state_file="$AXIOM_PROOF_STATE"
+          [ -f "$state_file" ] || fail "proof state missing at $state_file"
+          # stdout is a single 64-hex line (report_cli.nim runCanonicalDigestCli)
+          digest_out="$("$PROVE_BIN" report --canonical-digest --state-file "$state_file" --json)" \
+            || fail 'ax report --canonical-digest failed'
+          canonical_digest="$(printf '%s\n' "$digest_out" | head -1 | tr -d '[:space:]')"
+          printf '%s' "$canonical_digest" | grep -Eq '^[0-9a-f]{64}$' \
+            || fail "canonical digest output is not a 64-hex line: '$canonical_digest'"
+          printf '%s\n' "$canonical_digest" > "$evidence/canonical-digest.txt"
+          cp "$state_file" "$evidence/ax_proof_state.json" || fail 'proof state copy failed'
+          if [ -f "$AXIOM_STATE_DIR/logs/ax_prove_trajectory.jsonl" ]; then
+            cp "$AXIOM_STATE_DIR/logs/ax_prove_trajectory.jsonl" "$evidence/"
+          fi
+          # verdict summary: runOutcome verdict/gateVerdict + first unit
+          # propositionVerdict (BYO-Agent display projection shape)
+          verdict_summary="$(jq -r \
+            '((.runOutcome.verdict // "n/a") + "/" + (.runOutcome.gateVerdict // "n/a") + "/" + ((((.reportJson.display // .display).units // [])[0].propositionVerdict) // "n/a"))' \
+            "$state_file" 2>/dev/null || true)"
+          verdict_summary="${verdict_summary:-n/a/n/a/n/a}"
+          state_run_digest="$(jq -r '.canonicalRunDigest // "n/a"' "$state_file" 2>/dev/null || true)"
+          state_run_digest="${state_run_digest:-n/a}"
+          {
+            echo "canonical-digest=$canonical_digest"
+            echo "verdict-summary=$verdict_summary"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "CANONICAL_DIGEST=$canonical_digest"
+            echo "VERDICT_SUMMARY=$verdict_summary"
+            echo "STATE_CANONICAL_RUN_DIGEST=$state_run_digest"
+          } >> "$GITHUB_ENV"
+          echo "canonical digest: $canonical_digest"
+          echo "state canonicalRunDigest: $state_run_digest"
+          echo "verdict summary: $verdict_summary"
+
+      - name: 'engineBuild guard (vacuous-run prevention — 64-hex verifier build identity)'
+        id: engine-build-guard
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::engine-build-guard: $1" >&2; exit 1; }
+          evidence="$AXIOM_EVIDENCE_DIR"
+          vault="$AXIOM_STATE_DIR/build/certificates"
+          [ -d "$vault" ] || fail "certificate vault missing at $vault — no certificates were written"
+          cert_count=0
+          ids=""
+          while IFS= read -r cert; do
+            [ -n "$cert" ] || continue
+            cert_count=$((cert_count + 1))
+            id="$(jq -r '.toolchainIdentity.engineBuild // empty' "$cert" 2>/dev/null || true)"
+            [ -n "$id" ] \
+              || fail "certificate $(basename "$cert") carries no toolchainIdentity.engineBuild"
+            printf '%s' "$id" | grep -Eq '^[0-9a-f]{64}$' \
+              || fail "certificate $(basename "$cert") engineBuild '$id' is not 64-hex — 'unmeasured' or malformed identities are inadmissible"
+            ids="$ids $id"
+          done < <(find "$vault" -maxdepth 1 -name '*.json' ! -name 'manifest.json' -type f | sort)
+          [ "$cert_count" -ge 1 ] \
+            || fail 'no certificate files in the vault — the engineBuild guard cannot establish the verifier build identity'
+          distinct="$(printf '%s' "$ids" | tr ' ' '\n' | sed '/^$/d' | sort -u)"
+          distinct_count="$(printf '%s\n' "$distinct" | grep -c . || true)"
+          [ "$distinct_count" -eq 1 ] \
+            || fail "multiple distinct engineBuild ids across certificates ($distinct_count)"
+          engine_build_id="$distinct"
+          echo "engine-build-id=$engine_build_id" >> "$GITHUB_OUTPUT"
+          echo "ENGINE_BUILD_ID=$engine_build_id" >> "$GITHUB_ENV"
+          if [ -f "$vault/manifest.json" ]; then
+            cp "$vault/manifest.json" "$evidence/vault-manifest.json"
+          fi
+          find "$vault" -maxdepth 1 -name '*.json' -printf '%f\n' | sort > "$evidence/vault-certificates.txt"
+          echo "engineBuild guard: OK — $cert_count certificate(s), engineBuildId=$engine_build_id"
+
+      - name: 'Post fingerprint + Zero-Footprint assertion'
+        id: fingerprint-post
+        if: ${{ always() && steps.prove.outputs.prove-exit != '' }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::post-fingerprint: $1" >&2; exit 1; }
+          evidence="${RUNNER_TEMP}/ax-evidence"
+          post_tree="$(git -C subject rev-parse 'HEAD^{tree}')"
+          [ -n "$post_tree" ] || fail 'post HEAD^{tree} resolved empty'
+          porcelain="$(git -C subject status --porcelain)"
+          printf '%s\n' "$post_tree" > "$evidence/post_tree_hash.txt"
+          echo "POST_TREE_HASH=$post_tree" >> "$GITHUB_ENV"
+          if [ "$post_tree" = "$PRE_TREE_HASH" ] && [ -z "$porcelain" ]; then
+            zero_ok='true'
+          else
+            zero_ok='false'
+          fi
+          echo "zero-footprint-ok=$zero_ok" >> "$GITHUB_OUTPUT"
+          echo "ZERO_FOOTPRINT_OK=$zero_ok" >> "$GITHUB_ENV"
+          if [ "$zero_ok" != 'true' ]; then
+            echo "::error::Zero-Footprint violation: pre tree '$PRE_TREE_HASH' != post tree '$post_tree' (porcelain: '${porcelain:-<empty>}')"
+            exit 1
+          fi
+          echo "zero-footprint: OK — pre==post tree=$post_tree, porcelain clean"
+
+      - name: 'Write verify-record.json (machine-readable evidence identity)'
+        if: ${{ always() && steps.prove.outputs.prove-exit != '' }}
+        env:
+          SUBJECT_REPOSITORY: ${{ inputs.subject-repository }}
+          SUBJECT_COMMIT: ${{ inputs.subject-commit }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::verify-record: $1" >&2; exit 1; }
+          evidence="${RUNNER_TEMP}/ax-evidence"
+          pe="${PROVE_EXIT:-}"
+          case "$pe" in
+            ''|*[!0-9]*) fail "PROVE_EXIT not a numeric exit code: '$pe'" ;;
+          esac
+          tv="$evidence/toolchain-versions.txt"
+          [ -f "$tv" ] || fail 'toolchain-versions.txt missing'
+          nim_v="$(sed -n 's/^nim=//p' "$tv")"
+          z3_v="$(sed -n 's/^z3=//p' "$tv")"
+          lean_v="$(sed -n 's/^lean=//p' "$tv")"
+          pcre_v="$(sed -n 's/^libpcre3=//p' "$tv")"
+          zfo="${ZERO_FOOTPRINT_OK:-unknown}"
+          jq -n \
+            --argjson pe "$pe" \
+            --arg cd "${CANONICAL_DIGEST:-}" \
+            --arg ebi "${ENGINE_BUILD_ID:-}" \
+            --arg vs "${VERDICT_SUMMARY:-}" \
+            --arg zfo "$zfo" \
+            --arg ri "${RUNNER_IMAGE:-}" \
+            --arg sr "$SUBJECT_REPOSITORY" \
+            --arg sc "$SUBJECT_COMMIT" \
+            --arg av "${AXIOM_VERSION_PLAIN:-}" \
+            --arg bs "${AXIOM_BUNDLE_SHA256:-}" \
+            --arg ps "${PROPOSALS_SHA256:-}" \
+            --arg nim "$nim_v" \
+            --arg z3 "$z3_v" \
+            --arg lean "$lean_v" \
+            --arg pcre "$pcre_v" \
+            --arg pth "${PRE_TREE_HASH:-}" \
+            --arg qth "${POST_TREE_HASH:-}" \
+            --arg ris "${RUNNER_IMAGE_SOURCE:-}" \
+            --arg srd "${STATE_CANONICAL_RUN_DIGEST:-}" \
+            '{prove_exit: $pe,
+              canonical_digest: $cd,
+              engine_build_id: $ebi,
+              verdict_summary: $vs,
+              zero_footprint_ok: $zfo,
+              runner_image: $ri,
+              subject_repository: $sr,
+              subject_commit: $sc,
+              axiom_version: $av,
+              bundle_sha256: $bs,
+              proposals_sha256: $ps,
+              toolchain: {nim: $nim, z3: $z3, lean: $lean, libpcre3: $pcre},
+              pre_tree_hash: $pth,
+              post_tree_hash: $qth,
+              runner_image_source: $ris,
+              state_canonical_run_digest: $srd}' \
+            > "$evidence/verify-record.json"
+          jq empty "$evidence/verify-record.json" || fail 'verify-record.json is not valid JSON'
+          cat "$evidence/verify-record.json"
+
+      - name: 'Upload evidence artifact'
+        if: ${{ always() && steps.prove.outputs.prove-exit != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: "ax-verify-evidence-${{ inputs.proposals-artifact || 'inline' }}-${{ inputs.run-label }}"
+          path: '${{ env.AXIOM_EVIDENCE_DIR }}'
+          if-no-files-found: error
+
+      - name: 'Step summary (manifest, verdict, guards, zero-footprint, runner image)'
+        if: ${{ always() && steps.prove.outputs.prove-exit != '' }}
+        env:
+          SUBJECT_REPOSITORY_INPUT: ${{ inputs.subject-repository }}
+          SUBJECT_COMMIT_INPUT: ${{ inputs.subject-commit }}
+          RUN_LABEL_INPUT: ${{ inputs.run-label }}
+          PROPOSALS_ARTIFACT_NAME: ${{ inputs.proposals-artifact || 'inline' }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## ax-verify — bundle verification run'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| bundle | \`$AXIOM_TARBALL_NAME\` (sha256 \`$AXIOM_BUNDLE_SHA256\`) |"
+            echo "| axiom version | $AXIOM_VERSION_NORM |"
+            echo "| subject | \`$SUBJECT_REPOSITORY_INPUT\`@\`$SUBJECT_COMMIT_INPUT\` |"
+            echo "| prove exit | \`$PROVE_EXIT\` (0=PROVED, 1=DISPROVED — both in-contract; ≥2 fail-closed) |"
+            echo "| verdict | $VERDICT_SUMMARY |"
+            echo "| canonical digest | \`$CANONICAL_DIGEST\` |"
+            echo "| state canonicalRunDigest | \`$STATE_CANONICAL_RUN_DIGEST\` |"
+            echo "| engineBuildId | \`$ENGINE_BUILD_ID\` |"
+            echo "| zero-footprint | $ZERO_FOOTPRINT_OK (pre \`$PRE_TREE_HASH\` → post \`$POST_TREE_HASH\`) |"
+            echo "| runner image | $RUNNER_IMAGE ($RUNNER_IMAGE_SOURCE) |"
+            echo "| evidence artifact | \`ax-verify-evidence-$PROPOSALS_ARTIFACT_NAME-$RUN_LABEL_INPUT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
