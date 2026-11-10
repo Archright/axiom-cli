@@ -8,7 +8,7 @@
 #
 #   gh release download vX --repo Archright/axiom-cli
 #   sha256sum -c SHA256SUMS
-#   gh attestation verify <bundle> --bundle <attestation-bundle> --signer-repo Archright/Axiom
+#   gh attestation verify <bundle> -R Archright/Axiom --bundle <attestation-bundle> --signer-repo Archright/Axiom
 #   manifest binding (bundleSha256 / binarySha256 / version / tag / platform)
 #   ./ax --version (real execution at the bundle root)
 #
@@ -247,7 +247,7 @@ jobs:
           sha256sum -c SHA256SUMS || fail 'SHA256SUMS verification failed'
           # provenance: offline bundle verification, signer pinned to the Axiom
           # source repo (§1b trust model — README consumption contract)
-          gh attestation verify "$BUNDLE_TAR" --bundle attestation-bundle.jsonl --signer-repo Archright/Axiom \
+          gh attestation verify "$BUNDLE_TAR" -R Archright/Axiom --bundle attestation-bundle.jsonl --signer-repo Archright/Axiom \
             || fail 'gh attestation verify failed (signer-repo Archright/Axiom)'
           mkdir -p "${RUNNER_TEMP}/ax-bundle"
           tar -xzf "$BUNDLE_TAR" -C "${RUNNER_TEMP}/ax-bundle" || fail 'tar extraction failed'
