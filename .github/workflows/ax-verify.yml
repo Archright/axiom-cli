@@ -24,9 +24,12 @@
 # pre/post `git rev-parse HEAD^{tree}` + `git status --porcelain` pin the
 # subject identity; any drift fails the run.
 #
-# engineBuild guard (vacuous-run prevention): the run's vault certificates must
-# carry a 64-hex `toolchainIdentity.engineBuild` — "unmeasured" or missing
-# identities make the certificate inadmissible (Axiom FREEZE engineBuild rule).
+# engineBuild guard (vacuous-run prevention): the run's proof-state execution
+# identity envelope must carry a 64-hex `verifierBuildId` — "unmeasured" or
+# missing identities make the run inadmissible (Axiom FREEZE engineBuild rule;
+# the envelope is the observation surface for EVERY verdict class — a DISPROVED
+# subject writes no per-node certificate files, so vault files are evidence,
+# never the guard's source).
 #
 # Honest status: NOT yet exercised end-to-end. The first release has not been
 # published; the first live proof of this workflow is a workflow_dispatch smoke
@@ -591,34 +594,29 @@ jobs:
           set -euo pipefail
           fail() { echo "::error::engine-build-guard: $1" >&2; exit 1; }
           evidence="$AXIOM_EVIDENCE_DIR"
-          vault="$AXIOM_STATE_DIR/build/certificates"
-          [ -d "$vault" ] || fail "certificate vault missing at $vault — no certificates were written"
-          cert_count=0
-          ids=""
-          while IFS= read -r cert; do
-            [ -n "$cert" ] || continue
-            cert_count=$((cert_count + 1))
-            id="$(jq -r '.toolchainIdentity.engineBuild // empty' "$cert" 2>/dev/null || true)"
-            [ -n "$id" ] \
-              || fail "certificate $(basename "$cert") carries no toolchainIdentity.engineBuild"
-            printf '%s' "$id" | grep -Eq '^[0-9a-f]{64}$' \
-              || fail "certificate $(basename "$cert") engineBuild '$id' is not 64-hex — 'unmeasured' or malformed identities are inadmissible"
-            ids="$ids $id"
-          done < <(find "$vault" -maxdepth 1 -name '*.json' ! -name 'manifest.json' -type f | sort)
-          [ "$cert_count" -ge 1 ] \
-            || fail 'no certificate files in the vault — the engineBuild guard cannot establish the verifier build identity'
-          distinct="$(printf '%s' "$ids" | tr ' ' '\n' | sed '/^$/d' | sort -u)"
-          distinct_count="$(printf '%s\n' "$distinct" | grep -c . || true)"
-          [ "$distinct_count" -eq 1 ] \
-            || fail "multiple distinct engineBuild ids across certificates ($distinct_count)"
-          engine_build_id="$distinct"
+          state_file="$AXIOM_PROOF_STATE"
+          [ -f "$state_file" ] || fail "proof state missing at $state_file — no persisted run to account"
+          id="$(jq -r '.executionIdentity.verifierBuildId // empty' "$state_file")"
+          [ -n "$id" ] \
+            || fail 'proof state executionIdentity carries no verifierBuildId — the run cannot establish the verifier build identity'
+          printf '%s' "$id" | grep -Eq '^[0-9a-f]{64}$' \
+            || fail "executionIdentity.verifierBuildId '$id' is not 64-hex — 'unmeasured' or malformed identities are inadmissible"
+          engine_build_id="$id"
           echo "engine-build-id=$engine_build_id" >> "$GITHUB_OUTPUT"
           echo "ENGINE_BUILD_ID=$engine_build_id" >> "$GITHUB_ENV"
+          # Vault artifacts remain diagnostic evidence: certificates are only
+          # written on green (orchestrationVerified) runs, so the vault is
+          # observation input, never the guard's authority.
+          vault="$AXIOM_STATE_DIR/build/certificates"
           if [ -f "$vault/manifest.json" ]; then
             cp "$vault/manifest.json" "$evidence/vault-manifest.json"
           fi
-          find "$vault" -maxdepth 1 -name '*.json' -printf '%f\n' | sort > "$evidence/vault-certificates.txt"
-          echo "engineBuild guard: OK — $cert_count certificate(s), engineBuildId=$engine_build_id"
+          if [ -d "$vault" ]; then
+            find "$vault" -maxdepth 1 -name '*.json' -printf '%f\n' | sort > "$evidence/vault-certificates.txt"
+          else
+            : > "$evidence/vault-certificates.txt"
+          fi
+          echo "engineBuild guard: OK — engineBuildId=$engine_build_id (executionIdentity envelope, verdict-class independent)"
 
       - name: 'Post fingerprint + Zero-Footprint assertion'
         id: fingerprint-post
