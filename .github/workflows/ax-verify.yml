@@ -183,7 +183,9 @@ jobs:
           check_sha "$SUBJECT_COMMIT" 'subject-commit'
           check_slug "$SUBJECT_REPOSITORY" 'subject-repository'
           check_name "$RUN_LABEL" 'run-label'
-          check_name "$PROPOSALS_ARTIFACT" 'proposals-artifact'
+          # Empty proposals-artifact is the documented inline mode ("Empty → proposals-inline is used")
+          # — check_name cannot match a zero-byte string, so validate only when set.
+          [ -z "$PROPOSALS_ARTIFACT" ] || check_name "$PROPOSALS_ARTIFACT" 'proposals-artifact'
           # axiom-version: strip whitespace, v-prefix normalization, semver shape
           # (release-ship ④ parity — ^v\d+\.\d+\.\d+$)
           VERSION_NORM="$(printf '%s' "$AXIOM_VERSION_RAW" | tr -d '[:space:]')"
