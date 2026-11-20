@@ -151,6 +151,12 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+      # artifact attestation (CERTIFICATE_EVIDENCE provenance layer).
+      # GITHUB_TOKEN permissions cannot be escalated by a called reusable
+      # workflow: the caller must grant the same three permissions.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     outputs:
       prove-exit: ${{ steps.prove.outputs.prove-exit }}
       canonical-digest: ${{ steps.digest.outputs.canonical-digest }}
@@ -604,19 +610,49 @@ jobs:
           engine_build_id="$id"
           echo "engine-build-id=$engine_build_id" >> "$GITHUB_OUTPUT"
           echo "ENGINE_BUILD_ID=$engine_build_id" >> "$GITHUB_ENV"
-          # Vault artifacts remain diagnostic evidence: certificates are only
-          # written on green (orchestrationVerified) runs, so the vault is
-          # observation input, never the guard's authority.
+          # Evidence completeness (#188): the ENGINE decides what the evidence
+          # set is. This adapter only hands over the declared propositions and
+          # uploads the result — it must not assemble the vault itself.
+          #
+          # `ax cert export` binds every declared target to its canonical
+          # certificate body, writes the canonical manifest (scope +
+          # certificateSetDigest) and fails closed when a declared claim has no
+          # body. Non-declared verified rows are disclosed as outOfScope.
           vault="$AXIOM_STATE_DIR/build/certificates"
-          if [ -f "$vault/manifest.json" ]; then
-            cp "$vault/manifest.json" "$evidence/vault-manifest.json"
-          fi
-          if [ -d "$vault" ]; then
-            find "$vault" -maxdepth 1 -name '*.json' -printf '%f\n' | sort > "$evidence/vault-certificates.txt"
-          else
-            : > "$evidence/vault-certificates.txt"
-          fi
-          echo "engineBuild guard: OK — engineBuildId=$engine_build_id (executionIdentity envelope, verdict-class independent)"
+          [ -d "$vault" ] \
+            || fail "vault directory missing at $vault — cannot export admission evidence"
+          "$AXIOM_BUNDLE_ROOT/ax" cert export \
+            --vault "$vault" \
+            --out "$evidence" \
+            --proposals "$AXIOM_PROPOSALS_FILE" \
+            --json > "$evidence/cert-export.json" \
+            || fail 'ax cert export failed (declared claim set not substantiated)'
+          cert_digest="$(jq -r '.certificateSetDigest // empty' "$evidence/cert-export.json")"
+          printf '%s' "$cert_digest" | grep -Eq '^[0-9a-f]{64}$' \
+            || fail "ax cert export did not produce a 64-hex certificateSetDigest"
+          # Producer-side engine closure: verified entries must carry journal /
+          # identity / replay binding. Unavailable closure is exit 2 and fails
+          # the run (fail-closed — never downgrade to PASS).
+          set +e
+          "$AXIOM_BUNDLE_ROOT/ax" cert verify-export \
+            --bundle "$evidence/vault" \
+            --closure \
+            --project "$GITHUB_WORKSPACE/subject" \
+            --proposals "$AXIOM_PROPOSALS_FILE" \
+            --json > "$evidence/cert-export-verification.json"
+          verify_ec=$?
+          set -e
+          [ "$verify_ec" -eq 0 ] \
+            || fail "ax cert verify-export --closure failed (exit $verify_ec): $(jq -r '.reasonCode // "unknown"' "$evidence/cert-export-verification.json" 2>/dev/null)"
+          # GitHub attestation predicate: binds the artifact bytes to the
+          # Axiom semantic digest. GitHub is the delivery/provenance authority;
+          # Axiom is the semantic authority (contract §2.7).
+          inventory_sha="$(sha256sum "$evidence/vault/vault-certificates.txt" | cut -d' ' -f1)"
+          jq -n --arg cd "$cert_digest" --arg inv "$inventory_sha" \
+            '{schema: "axiom.admission.certificate-set-predicate.v1",
+              certificateSetDigest: $cd,
+              vaultInventorySha256: $inv}' > "$evidence/attestation-predicate.json"
+          echo "engineBuild guard: OK — engineBuildId=$engine_build_id certificateSetDigest=$cert_digest"
 
       - name: 'Post fingerprint + Zero-Footprint assertion'
         id: fingerprint-post
@@ -704,12 +740,27 @@ jobs:
           cat "$evidence/verify-record.json"
 
       - name: 'Upload evidence artifact'
+        id: evidence-upload
         if: ${{ always() && steps.prove.outputs.prove-exit != '' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: "ax-verify-evidence-${{ inputs.proposals-artifact || 'inline' }}-${{ inputs.run-label }}"
           path: '${{ env.AXIOM_EVIDENCE_DIR }}'
           if-no-files-found: error
+
+      # Provenance, not semantics: GitHub attests that these artifact bytes were
+      # produced by this workflow run; the predicate carries Axiom's
+      # certificateSetDigest so the semantic authority stays with the engine.
+      # Runs only when the engine export + producer closure succeeded (a failed
+      # run has no predicate to bind, and must not look attested).
+      - name: 'Attest evidence artifact (Axiom certificate-set predicate)'
+        if: ${{ always() && steps.engine-build-guard.outcome == 'success' && steps.evidence-upload.outputs.artifact-digest != '' }}
+        uses: actions/attest@v4
+        with:
+          subject-name: "ax-verify-evidence-${{ inputs.proposals-artifact || 'inline' }}-${{ inputs.run-label }}"
+          subject-digest: sha256:${{ steps.evidence-upload.outputs.artifact-digest }}
+          predicate-type: https://github.com/Archright/Axiom/attestation/certificate-set/v1
+          predicate-path: ${{ env.AXIOM_EVIDENCE_DIR }}/attestation-predicate.json
 
       - name: 'Step summary (manifest, verdict, guards, zero-footprint, runner image)'
         if: ${{ always() && steps.prove.outputs.prove-exit != '' }}
